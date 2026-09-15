@@ -1,0 +1,29 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+
+# Virtual environments
+.venv/
+
+# Ripped audio and disc metadata
+*.flac
+*.flac.part
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.opus
+*.cue
+*.toc
+*.log
+*.m3u
+*.m3u8
+*.jpg
+*.jpeg
+*.png
+*.accurip
+whipper.log

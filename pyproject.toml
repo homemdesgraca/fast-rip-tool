@@ -1,0 +1,18 @@
+[project]
+name = "cd-rip-queue"
+version = "0.1.0"
+description = "Sequential Textual front end for accurate CD ripping with whipper"
+authors = [
+    { name = "homemdesgraca", email = "homemdesgraca@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "textual>=8,<9",
+]
+
+[project.scripts]
+cd-rip-queue = "cd_rip_queue:main"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
