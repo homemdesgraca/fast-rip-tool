@@ -31,6 +31,8 @@ Start the interactive queue:
 uv run cd-rip-queue
 ```
 
+The default output directory is `./ripped`. Use `--output` to change it.
+
 Check optical drive detection and configured read offset:
 
 ```bash
@@ -43,9 +45,11 @@ Run in plain prompt mode without the full-screen TUI:
 uv run cd-rip-queue --no-tui
 ```
 
+
 ## Keybindings
 
 - Enter: Rip inserted CD
 - p: Open most recently ripped album in Picard
+- l: Look up lyrics for the most recently ripped album (searches lrclib.net)
 - r: Reset view to ready state
 - q: Quit

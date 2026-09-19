@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +20,9 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Center, Vertical
-from textual.widgets import Footer, Header, Static
+from textual.events import Key
+from textual.screen import Screen
+from textual.widgets import Footer, Header, OptionList, Static
 
 CommandRunner = Callable[[Sequence[str], Path], int]
 
@@ -31,7 +37,6 @@ class RipperConfig:
     allow_cdr: bool = False
     keep_going: bool = False
     track_template: str = "%A/%d/%N-%t - %n"
-    disc_template: str = "%A/%d/%A - %d (disc %N)"
 
     def command(self) -> list[str]:
         command = [
@@ -43,8 +48,6 @@ class RipperConfig:
             str(self.output_directory),
             "--track-template",
             self.track_template,
-            "--disc-template",
-            self.disc_template,
             "--cover-art",
             self.cover_art,
             "--max-retries",
@@ -111,6 +114,119 @@ def open_in_picard(paths: Sequence[Path]) -> bool:
     return True
 
 
+def _lrclib_search(query: str, timeout: int = 10) -> list[dict] | None:
+    """Search LRCLib for lyrics. Returns list of results or None on error."""
+    url = f"https://lrclib.net/api/search?q={urllib.parse.quote(query)}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "fast-rip-tool"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+        return data if isinstance(data, list) else []
+    except Exception:
+        return None
+
+
+def _extract_track_info(flac_path: Path) -> tuple[str, str]:
+    """Extract artist and track title from a FLAC filepath.
+
+    Uses the directory structure (artist/album/track.flac) and filename
+    pattern ({track}-{title}.flac).
+    """
+    artist = flac_path.parent.parent.name if len(flac_path.parent.parts) >= 2 else flac_path.parent.name
+    stem = flac_path.stem
+    match = re.match(r"^\d+-\d+\s*-\s*(.+)$", stem)
+    title = match.group(1) if match else stem
+    return artist, title
+
+
+async def fetch_and_write_lyrics(album_path: Path) -> tuple[int, int]:
+    """Fetch lyrics for all tracks in an album and write .lrc files beside them.
+
+    Returns (success_count, fail_count).
+    """
+    flac_files = sorted(album_path.glob("*.flac"))
+    if not flac_files:
+        return 0, 0
+
+    success = 0
+    fail = 0
+    for flac in flac_files:
+        artist, title = _extract_track_info(flac)
+        query = f"{artist} - {title}"
+        results = await asyncio.to_thread(_lrclib_search, query)
+        if not results:
+            fail += 1
+            continue
+        # Prefer exact artist + track name match
+        best = None
+        for r in results:
+            rn = r.get("trackName", "")
+            an = r.get("artistName", "")
+            if rn and an and rn.lower() == title.lower() and an.lower() == artist.lower():
+                best = r
+                break
+        if best is None:
+            best = results[0]
+        synced = best.get("syncedLyrics")
+        if not synced:
+            fail += 1
+            continue
+        lrc_path = flac.with_suffix(".lrc")
+        try:
+            await asyncio.to_thread(lrc_path.write_text, synced, encoding="utf-8")
+            success += 1
+        except OSError:
+            fail += 1
+
+    return success, fail
+
+
+class LyricsScreen(Screen[Path | None]):
+    """Screen for selecting an album to look up lyrics."""
+
+    CSS = """
+    Screen {
+        layout: vertical;
+        padding: 1 3;
+    }
+    #lyrics-title {
+        margin-bottom: 1;
+        color: $text;
+        text-style: bold;
+    }
+    #album-list {
+        height: 1fr;
+    }
+    """
+
+    def __init__(self, albums: list[Path]) -> None:
+        super().__init__()
+        self._albums = albums
+
+    def compose(self) -> ComposeResult:
+        yield Static("Select an album to look up lyrics (Enter to confirm, Escape to cancel)", id="lyrics-title")
+        yield OptionList(id="album-list")
+
+    def on_mount(self) -> None:
+        option_list = self.query_one("#album-list", OptionList)
+        for album in self._albums:
+            option_list.add_option(str(album))
+        if self._albums:
+            option_list.highlighted = len(self._albums) - 1
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        idx = event.option_index
+        if idx is not None and 0 <= idx < len(self._albums):
+            self.dismiss(self._albums[idx])
+
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "escape":
+            self.dismiss(None)
+
+
+
+
 class RipQueueApp(App[None]):
     TITLE = "CD Rip Queue"
     SUB_TITLE = "AccurateRip via whipper"
@@ -162,8 +278,9 @@ class RipQueueApp(App[None]):
     }
     """
     BINDINGS = [
-        Binding("enter", "rip", "Rip next disc", priority=True),
+        Binding("space", "rip", "Rip next disc", priority=True),
         Binding("p", "open_picard", "Open in Picard"),
+        Binding("l", "lyrics", "Look up lyrics"),
         Binding("r", "reset", "Ready"),
         Binding("q", "quit", "Quit"),
     ]
@@ -201,6 +318,7 @@ class RipQueueApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self.last_albums = changed_album_directories(self.config.output_directory, 0)
         self._show_ready()
 
     def _set_text(self, selector: str, value: str, *, style: str = "") -> None:
@@ -296,6 +414,36 @@ class RipQueueApp(App[None]):
             self.notify("Picard was not found", severity="error")
 
 
+    def action_lyrics(self) -> None:
+        if self.ripping:
+            return
+        if not self.last_albums:
+            self.notify("No albums have been ripped yet", severity="warning")
+            return
+        self._show_album_selector()
+
+    def _show_album_selector(self) -> None:
+        self.app.push_screen(LyricsScreen(self.last_albums), self._on_lyrics_selected)
+
+    def _on_lyrics_selected(self, album_path: Path | None) -> None:
+        if album_path is None:
+            return
+        self._fetch_lyrics_for_album(album_path)
+
+    @work(exclusive=True)
+    async def _fetch_lyrics_for_album(self, album_path: Path) -> None:
+        self._set_text("#state", "FETCHING LYRICS", style="bold yellow")
+        self._set_text("#detail", f"Searching lyrics for {album_path.name}...")
+        success, fail = await fetch_and_write_lyrics(album_path)
+        if success:
+            self.notify(f"Wrote {success} .lrc file(s) for {album_path.name}")
+            if fail:
+                self.notify(f"Could not find lyrics for {fail} track(s)", severity="warning")
+        else:
+            self.notify(f"Could not find lyrics for any track in {album_path.name}", severity="error")
+        self._show_ready()
+
+
 def run_plain(config: RipperConfig) -> int:
     completed = 0
     last_albums: list[Path] = []
@@ -330,8 +478,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path.cwd(),
-        help="music library root (default: current directory)",
+        default=Path.cwd() / "ripped",
+        help="music library root (default: ./ripped)",
     )
     parser.add_argument("--country", help="prefer MusicBrainz releases from COUNTRY")
     parser.add_argument(
@@ -348,11 +496,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--track-template",
         default="%A/%d/%N-%t - %n",
         help="whipper track path template",
-    )
-    parser.add_argument(
-        "--disc-template",
-        default="%A/%d/%A - %d (disc %N)",
-        help="whipper cue/log/playlist path template",
     )
     parser.add_argument(
         "--no-tui",
@@ -396,7 +539,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         allow_cdr=args.allow_cdr,
         keep_going=args.keep_going,
         track_template=args.track_template,
-        disc_template=args.disc_template,
     )
     if args.no_tui or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return run_plain(config)
